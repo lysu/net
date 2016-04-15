@@ -1731,6 +1731,29 @@ func (sc *serverConn) write100ContinueHeaders(st *stream) {
 	})
 }
 
+func (sc *serverConn) write200Headers(st *stream) {
+	sc.writeFrameFromHandler(frameWriteMsg{
+		write: write200HeadersFrame{streamID: st.id},
+		stream: st,
+	})
+}
+
+type write200HeadersFrame struct {
+	streamID uint32
+}
+
+func (w write200HeadersFrame) writeFrame(ctx writeContext) error {
+	enc, buf := ctx.HeaderEncoder()
+	buf.Reset()
+	encKV(enc, ":status", "200")
+	return ctx.Framer().WriteHeaders(HeadersFrameParam{
+		StreamID:      w.streamID,
+		BlockFragment: buf.Bytes(),
+		EndStream:     true,
+		EndHeaders:    true,
+	})
+}
+
 // A bodyReadMsg tells the server loop that the http.Handler read n
 // bytes of the DATA from the client on the given stream.
 type bodyReadMsg struct {
@@ -1842,6 +1865,8 @@ func (b *requestBody) Read(p []byte) (n int, err error) {
 // and buffers are reused between multiple requests.
 type responseWriter struct {
 	rws *responseWriterState
+	hacked bool
+	lock sync.Mutex
 }
 
 // Optional http.ResponseWriter interfaces implemented.
@@ -2058,6 +2083,26 @@ func (w *responseWriter) Flush() {
 	}
 }
 
+type Connectable interface {
+	Hack() http.ResponseWriter
+	ConnectOK()
+}
+
+func (w *responseWriter) ConnectOK() {
+	w.rws.conn.write200Headers(w.rws.stream)
+}
+
+func (w *responseWriter) Hack() http.ResponseWriter {
+	nw := &responseWriter{
+		rws: w.rws,
+		hacked: false,
+	}
+	w.lock.Lock()
+	w.hacked = true
+	w.lock.Unlock()
+	return nw
+}
+
 func (w *responseWriter) CloseNotify() <-chan bool {
 	rws := w.rws
 	if rws == nil {
@@ -2089,6 +2134,12 @@ func (w *responseWriter) Header() http.Header {
 }
 
 func (w *responseWriter) WriteHeader(code int) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	if w.hacked {
+		return
+	}
+
 	rws := w.rws
 	if rws == nil {
 		panic("WriteHeader called after Handler finished")
@@ -2125,10 +2176,20 @@ func cloneHeader(h http.Header) http.Header {
 // * -> responseWriterState.writeChunk(p []byte)
 // * -> responseWriterState.writeChunk (most of the magic; see comment there)
 func (w *responseWriter) Write(p []byte) (n int, err error) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	if w.hacked {
+		return 0, nil
+	}
 	return w.write(len(p), p, "")
 }
 
 func (w *responseWriter) WriteString(s string) (n int, err error) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	if w.hacked {
+		return 0, nil
+	}
 	return w.write(len(s), nil, s)
 }
 
